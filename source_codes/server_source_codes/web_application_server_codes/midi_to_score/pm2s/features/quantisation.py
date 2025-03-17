@@ -1,0 +1,81 @@
+import os
+import torch
+import numpy as np
+
+from pm2s.features._processor import MIDIProcessor
+from pm2s.models.quantisation import RNNJointQuantisationModel
+from pm2s.io.midi_read import read_note_sequence
+from pm2s.features.beat import RNNJointBeatProcessor
+from pm2s.constants import N_per_beat, tolerance, model_state_dict_paths
+
+
+class RNNJointQuantisationProcessor(MIDIProcessor):
+
+    def __init__(self, state_dict_path=None):
+        if state_dict_path is None:
+            state_dict_path = model_state_dict_paths['quantisation']['state_dict_path']
+        zenodo_path = model_state_dict_paths['quantisation']['zenodo_path']
+
+        self._model = RNNJointQuantisationModel()
+        self.load(state_dict_path=state_dict_path, zenodo_path=zenodo_path)
+
+        # Load the beat model
+        if not os.path.exists(model_state_dict_paths['beat']['state_dict_path']):
+            print('Downloading beat model_state_dict from Zenodo...')
+            os.system('wget -O "{}" "{}"'.format(model_state_dict_paths['beat']['state_dict_path'], model_state_dict_paths['beat']['zenodo_path']))
+
+        self._model.beat_model.load_state_dict(torch.load(model_state_dict_paths['beat']['state_dict_path']))
+
+        self._model.eval()
+
+    def process_note_seq(self, note_seq):
+        # Process note sequence
+
+        x = torch.tensor(note_seq).unsqueeze(0)
+
+        # Forward pass
+        beat_probs, downbeat_probs, onset_position_probs, note_value_probs = self._model(x)
+
+        # Post-processing
+        onset_positions_idx = onset_position_probs[0].topk(1, dim=0)[1].squeeze(0) # (n_notes,)
+        note_values_idx = note_value_probs[0].topk(1, dim=0)[1].squeeze(0) # (n_notes,)
+
+        onset_positions_idx = onset_positions_idx.detach().numpy()
+        note_values_idx = note_values_idx.detach().numpy()
+
+        beat_probs = beat_probs.squeeze(0).detach().numpy()
+        downbeat_probs = downbeat_probs.squeeze(0).detach().numpy()
+        onsets = note_seq[:, 1]
+
+        onset_positions, note_values = self.pps(onset_positions_idx, note_values_idx, beat_probs, downbeat_probs, onsets)
+
+        return onset_positions, note_values
+
+    def pps(self, onset_positions_idx, note_values_idx, beat_probs, downbeat_probs, onsets):
+        # post-processing
+        # Convert onset position and note value indexes to actual values
+        # Use predicted beat as a reference
+
+        # get beats prediction from beat_probs and downbeat_probs
+        beats, _ = RNNJointBeatProcessor.pps(beat_probs, downbeat_probs, onsets)
+
+        # get predicted onset positions and note values in beats
+        onset_positions_raw = onset_positions_idx / N_per_beat
+        note_values_raw = note_values_idx / N_per_beat
+
+        # Convert onset positions within a beat to absolute positions
+        onset_positions = np.zeros_like(onset_positions_raw)
+        note_values = np.zeros_like(note_values_raw)
+
+        beat_idx = 0
+        note_idx = 0
+
+        while note_idx < len(onset_positions_raw):
+            if beat_idx < len(beats) and onsets[note_idx] >= beats[beat_idx]:
+                beat_idx += 1
+
+            onset_positions[note_idx] = onset_positions_raw[note_idx] + beat_idx
+            note_values[note_idx] = note_values_raw[note_idx]
+            note_idx += 1
+
+        return onset_positions, note_values

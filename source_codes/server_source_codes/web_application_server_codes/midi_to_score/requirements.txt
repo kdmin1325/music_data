@@ -1,0 +1,4 @@
+torch==1.12.1
+pretty-midi
+mir_eval==0.6
+mido==1.2.9
